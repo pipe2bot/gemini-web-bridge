@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "Gemini Web AI Bridge",
+  "version": "1.0.0",
+  "description": "Bridges local AI agent with Gemini Web UI",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "https://gemini.google.com/*",
+    "http://127.0.0.1/*",
+    "ws://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://localhost/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gemini-bridge@local"
+    }
+  }
+}
