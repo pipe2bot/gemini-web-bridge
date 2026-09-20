@@ -161,17 +161,27 @@ Restart Firefox. The extension is permanently locked and loaded under `about:add
 
 ## 🧪 Verification
 
-Run the built-in unit test suite to verify end-to-end communication, automatic Angular CDK thinking toggle, and response integrity:
+Run the built-in unit test suite to verify end-to-end communication, automatic Angular CDK thinking toggle, attachment/OCR pipeline, and response integrity:
 
 ```bash
+# Verify Extended Thinking mode and DOM picker state
 python3 test_extended_thinking.py
+
+# Verify multimodal image attachment and OCR pipeline
+python3 test_attachment_support.py
 ```
 
 Expected output:
 ```text
 ..
 ----------------------------------------------------------------------
-Ran 2 tests in 8.733s
+Ran 2 tests in 6.364s
+
+OK
+
+..
+----------------------------------------------------------------------
+Ran 2 tests in 21.130s
 
 OK
 ```
@@ -180,18 +190,46 @@ OK
 
 ## 💬 API Usage
 
-### OpenAI SDK Compatible
+### OpenAI SDK Compatible (Text, Vision & File Attachments)
+
+The bridge natively supports multimodal image inputs (OCR, vision) as well as file attachments (PDFs, text files, code, documents) supported by Gemini Web UI. Local file paths are automatically detected, read, and converted to base64 Data URLs by `server.py`.
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="sk-local")
 
+# 1. Extended Thinking prompt
 response = client.chat.completions.create(
     model="gemini-thinking-web",
     messages=[{"role": "user", "content": "Explain quantum decoherence simply."}],
     extra_body={"thinking": True, "include_thoughts": True}
 )
+print(response.choices[0].message.content)
 
+# 2. Multimodal OCR & Image Analysis (local path or data URL)
+response = client.chat.completions.create(
+    model="gemini-thinking-web",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe and analyze this screenshot verbatim."},
+                {"type": "image_url", "image_url": {"url": "/path/to/screenshot.png"}}
+            ]
+        }
+    ],
+    extra_body={"thinking": True}
+)
+print(response.choices[0].message.content)
+
+# 3. Document / File Attachment (PDF, CSV, Code, Text)
+# Pass local file path directly via extra_body or OpenAI content block
+response = client.chat.completions.create(
+    model="gemini-thinking-web",
+    messages=[{"role": "user", "content": "Summarize the key findings in this document."}],
+    extra_body={"image_path": "/path/to/document.pdf", "thinking": True}
+)
 print(response.choices[0].message.content)
 ```
 
@@ -199,11 +237,20 @@ print(response.choices[0].message.content)
 ```python
 from gemini_client import query_gemini
 
+# Standard query
 answer = query_gemini(
     prompt="Solve this math puzzle: If 2x + 5 = 19, what is x?",
     model="gemini-thinking-web"
 )
 print(answer)
+
+# Image / File attachment query (PNG, JPG, PDF, TXT, CSV, DOCX)
+result = query_gemini(
+    prompt="Perform OCR on this image.",
+    image_path="screenshot.png",
+    model="gemini-thinking-web"
+)
+print(result)
 ```
 
 ---

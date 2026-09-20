@@ -1,10 +1,61 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import json
+import mimetypes
+import os
+from pathlib import Path
 import re
 import time
 import uuid
 from aiohttp import web
+
+def file_to_data_url(file_path: str) -> str:
+    path = Path(file_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Local image file not found: {file_path}")
+
+    mime_type, _ = mimetypes.guess_type(str(path))
+    if not mime_type:
+        mime_type = "image/png"
+
+    with open(path, "rb") as f:
+        encoded_data = base64.b64encode(f.read()).decode("utf-8")
+
+    return f"data:{mime_type};base64,{encoded_data}"
+
+def extract_image_payload(body: dict, messages: list) -> str | None:
+    for key in ["image_path", "attachment", "attachments"]:
+        val = body.get(key)
+        if val:
+            target = val[0] if isinstance(val, list) else val
+            if isinstance(target, str):
+                return file_to_data_url(target) if os.path.isfile(os.path.expanduser(target)) else target
+
+    if body.get("image_data"):
+        raw_val = body["image_data"]
+        if isinstance(raw_val, str):
+            if os.path.isfile(os.path.expanduser(raw_val)):
+                return file_to_data_url(raw_val)
+            if raw_val.startswith("data:"):
+                return raw_val
+            return f"data:image/png;base64,{raw_val}"
+
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    img_info = part.get("image_url", {})
+                    url = img_info.get("url") if isinstance(img_info, dict) else img_info
+                    if not url:
+                        continue
+                    if url.startswith("data:"):
+                        return url
+                    if os.path.isfile(os.path.expanduser(url)):
+                        return file_to_data_url(url)
+                    return url
+    return None
 
 CONNECTED_EXTENSIONS = set()
 PENDING_REQUESTS = {}
@@ -123,7 +174,9 @@ async def websocket_handler(request):
                     role = "agent"
                     prompt = data.get("prompt")
                     new_chat = data.get("new_chat", False)
-                    image_data = data.get("image_data")
+                    image_data = data.get("image_data") or data.get("image") or data.get("image_path")
+                    if image_data and isinstance(image_data, str) and os.path.isfile(os.path.expanduser(image_data)):
+                        image_data = file_to_data_url(image_data)
                     include_thoughts = data.get("include_thoughts", False)
                     thinking = data.get("thinking", None)
                     req_id = str(uuid.uuid4())
@@ -145,7 +198,8 @@ async def websocket_handler(request):
                         "new_chat": new_chat,
                         "image_data": image_data,
                         "include_thoughts": include_thoughts,
-                        "thinking": thinking
+                        "thinking": thinking,
+                        "model": data.get("model", "gemini-web")
                     })
 
                     try:
@@ -203,6 +257,7 @@ async def handle_chat_completions(request):
         thinking = False
 
     full_prompt, extracted_image_data = extract_prompt_for_gemini(messages, new_chat)
+    image_data = extract_image_payload(body, messages) or extracted_image_data
     req_id = f"chatcmpl-{uuid.uuid4()}"
 
     queue = asyncio.Queue()
@@ -216,9 +271,10 @@ async def handle_chat_completions(request):
         "id": req_id,
         "prompt": full_prompt,
         "new_chat": new_chat,
-        "image_data": extracted_image_data,
+        "image_data": image_data,
         "include_thoughts": include_thoughts,
-        "thinking": thinking
+        "thinking": thinking,
+        "model": model
     })
 
     if stream:

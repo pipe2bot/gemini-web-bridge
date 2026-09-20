@@ -7,16 +7,27 @@ import json
 import urllib.request
 import urllib.error
 
+from typing import Optional
+
 BRIDGE_URL = "http://127.0.0.1:8765/v1/chat/completions"
 
-def query_gemini(prompt: str, system_prompt: str = None, new_chat: bool = False, model: str = "gemini-web") -> str:
+def query_gemini(
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    new_chat: bool = False,
+    model: str = "gemini-web",
+    image_path: Optional[str] = None,
+    image_data: Optional[str] = None
+) -> str:
     """
     Sends a query to the Gemini Web Bridge OpenAI endpoint.
     
     :param prompt: User prompt text
     :param system_prompt: Optional system instruction
     :param new_chat: If True, resets conversation thread before sending
-    :param model: Model identifier ('gemini-web')
+    :param model: Model identifier ('gemini-web', 'gemini-thinking-web')
+    :param image_path: Optional local file path to image attachment
+    :param image_data: Optional base64 data URL or raw base64 string
     :return: Generated text response from Gemini Web UI
     """
     messages = []
@@ -30,6 +41,10 @@ def query_gemini(prompt: str, system_prompt: str = None, new_chat: bool = False,
         "new_chat": new_chat,
         "stream": False
     }
+    if image_path:
+        payload["image_path"] = image_path
+    elif image_data:
+        payload["image_data"] = image_data
 
     headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(BRIDGE_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")

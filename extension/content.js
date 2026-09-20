@@ -37,7 +37,7 @@
   api.runtime.onMessage.addListener((data) => {
     if (data.command === "generate") {
       isProcessing = false;
-      handleGenerate(data.id, data.prompt, data.new_chat, data.image_data, data.include_thoughts, data.thinking);
+      handleGenerate(data.id, data.prompt, data.new_chat, data.image_data, data.include_thoughts, data.thinking, data.model);
     }
   });
 
@@ -62,64 +62,107 @@
            document.querySelector('.new-chat-button');
   }
 
-  async function toggleThinkingMode(enable) {
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-    const pickerBtn = Array.from(document.querySelectorAll('button')).find((btn) => {
-      const label = btn.getAttribute('aria-label') || '';
-      return /mode picker/i.test(label);
-    });
-
-    if (!pickerBtn) {
-      console.warn('[Gemini Bridge] Mode picker button not found.');
-      return false;
+  async function setGeminiModel(modelName = 'gemini-web', enableThinking = undefined) {
+    const normalizedModel = String(modelName).toLowerCase();
+    let targetBase = 'flash'; // Always 3.8 Flash, never Flash-Lite
+    if (normalizedModel.includes('pro')) {
+      targetBase = 'pro';
+    } else if (normalizedModel.includes('lite')) {
+      targetBase = 'flash-lite';
     }
 
-    const btnContent = `${pickerBtn.getAttribute('aria-label') || ''} ${pickerBtn.textContent || ''}`;
-    const isCurrentlyExtended = /extended|thinking/i.test(btnContent);
+    let targetThinking = false;
+    if (typeof enableThinking === 'boolean') {
+      targetThinking = enableThinking;
+    } else if (normalizedModel.includes('thinking')) {
+      targetThinking = true;
+    }
 
-    if (enable === isCurrentlyExtended) {
+    const getPickerBtn = () => {
+      return document.querySelector('[data-test-id="bard-mode-menu-button"]') ||
+             Array.from(document.querySelectorAll('button')).find((b) => {
+               const label = (b.getAttribute('aria-label') || b.textContent || '').toLowerCase();
+               return label.includes('mode picker') || (label.includes('currently') && (label.includes('flash') || label.includes('pro')));
+             });
+    };
+
+    const pickerBtn = getPickerBtn();
+    if (!pickerBtn) return false;
+
+    const parseCurrent = () => {
+      const label = (pickerBtn.getAttribute('aria-label') || pickerBtn.textContent || '').toLowerCase();
+      const thinking = label.includes('extended');
+      let base = 'unknown';
+      if (label.includes('flash-lite') || label.includes('flash lite')) {
+        base = 'flash-lite';
+      } else if (label.includes('flash')) {
+        base = 'flash';
+      } else if (label.includes('pro')) {
+        base = 'pro';
+      }
+      return { base, thinking };
+    };
+
+    let current = parseCurrent();
+    if (current.base === targetBase && current.thinking === targetThinking) {
       return true;
     }
 
-    pickerBtn.click();
-    await sleep(350);
+    const openMenu = async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await new Promise(r => setTimeout(r, 150));
+      if (!document.querySelector('gem-menu-item')) {
+        pickerBtn.click();
+        for (let i = 0; i < 20; i++) {
+          if (document.querySelector('gem-menu-item')) break;
+          await new Promise(r => setTimeout(r, 50));
+        }
+      }
+    };
 
     const dismissMenu = async () => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await sleep(250);
+      await new Promise(r => setTimeout(r, 150));
     };
 
-    const menuContainer = document.querySelector('.cdk-overlay-container, [role="menu"]');
-    const items = menuContainer
-      ? Array.from(menuContainer.querySelectorAll('[role="menuitem"], .mat-mdc-menu-item, button'))
-      : [];
-
-    let targetItem = null;
-    if (enable) {
-      targetItem = items.find((el) => {
-        const text = `${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`;
-        return /extended|thinking/i.test(text);
-      });
-    } else {
-      targetItem = items.find((el) => {
-        const text = `${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`;
-        return /flash/i.test(text) && !/extended|thinking/i.test(text);
-      });
-    }
-
-    if (targetItem) {
-      targetItem.click();
-      await sleep(350);
-      if (document.querySelector('.cdk-overlay-container [role="menu"]')) {
-        await dismissMenu();
+    // 1. If base model differs, open menu and select base model
+    if (current.base !== targetBase) {
+      await openMenu();
+      const items = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitem"]'));
+      let row = null;
+      if (targetBase === 'flash') {
+        row = items.find(el => {
+          const txt = (el.textContent || '').toLowerCase();
+          return (txt.includes('3.8 flash') || txt.includes('all-around help')) ||
+                 (txt.includes('flash') && !txt.includes('lite'));
+        });
+      } else if (targetBase === 'pro') {
+        row = items.find(el => (el.textContent || '').toLowerCase().includes('pro'));
+      } else if (targetBase === 'flash-lite') {
+        row = items.find(el => (el.textContent || '').toLowerCase().includes('lite'));
       }
-      return true;
+      if (row) {
+        row.click();
+        await new Promise(r => setTimeout(r, 350));
+      }
+      await dismissMenu();
+      current = parseCurrent();
     }
 
-    console.warn(`[Gemini Bridge] Failed to find menu option for enable=${enable}`);
-    await dismissMenu();
-    return false;
+    // 2. If thinking mode differs, open menu and toggle Extended thinking
+    if (current.thinking !== targetThinking) {
+      await openMenu();
+      const items = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitem"]'));
+      const thinkingRow = items.find(el => (el.textContent || '').toLowerCase().includes('extended thinking'));
+      if (thinkingRow) {
+        thinkingRow.click();
+        await new Promise(r => setTimeout(r, 350));
+      }
+      await dismissMenu();
+    }
+
+    current = parseCurrent();
+    return current.base === targetBase && current.thinking === targetThinking;
   }
 
   function getResponseContent(element, includeThoughts) {
@@ -143,27 +186,92 @@
     return { text: cleanText || element.innerText.trim() };
   }
 
-  async function uploadImage(base64DataUrl) {
-    const fileInput = document.querySelector('input[type="file"]');
-    if (!fileInput) return false;
+  async function uploadAttachment(base64DataUrl) {
+    const response = await fetch(base64DataUrl);
+    const blob = await response.blob();
+    const mimeType = blob.type || 'application/octet-stream';
+    const isImage = mimeType.startsWith('image/');
+    const inputSelector = isImage
+      ? 'input[type="file"][accept*="image"]'
+      : 'input[type="file"]:not([accept*="image"]), input[type="file"]';
 
-    try {
-      const res = await fetch(base64DataUrl);
-      const blob = await res.blob();
-      const file = new File([blob], "image.png", { type: blob.type || "image/png" });
+    let fileInput = document.querySelector(inputSelector);
 
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      fileInput.files = dt.files;
-      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-      fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+    if (!fileInput) {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await new Promise((r) => setTimeout(r, 200));
 
-      await new Promise(r => setTimeout(r, 1200));
-      return true;
-    } catch (e) {
-      console.error("[Gemini Bridge] Image upload error:", e);
-      return false;
+      const ta = document.querySelector('rich-textarea');
+      const container = ta ? (ta.closest('.input-area') || ta.closest('form') || ta.parentElement.parentElement) : document;
+      const uploadBtn = (container && container.querySelector('button[aria-label*="Upload & tools"]')) ||
+                        (container && container.querySelector('button[aria-label*="Upload"]')) ||
+                        Array.from(document.querySelectorAll('button')).find(b =>
+                          /upload & tools/i.test(b.getAttribute('aria-label') || '')
+                        );
+
+      if (!uploadBtn) {
+        throw new Error('Upload button not found in Gemini Web UI.');
+      }
+      uploadBtn.click();
+
+      const menuStart = Date.now();
+      while (!fileInput && Date.now() - menuStart < 3000) {
+        await new Promise((r) => setTimeout(r, 100));
+        fileInput = document.querySelector(inputSelector);
+      }
+
+      if (!fileInput) {
+        fileInput = document.querySelector('input[type="file"]');
+      }
+      if (!fileInput) {
+        throw new Error('File input failed to appear after opening upload menu.');
+      }
     }
+
+    // Dismiss any open CDK overlay menu
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        code: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+    await new Promise((r) => setTimeout(r, 200));
+
+    const extension = mimeType.includes('/') ? mimeType.split('/')[1].split('+')[0] : 'bin';
+    const file = new File([blob], `attachment_${Date.now()}.${extension}`, {
+      type: mimeType,
+    });
+
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    fileInput.files = dt.files;
+
+    fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    await new Promise((resolve, reject) => {
+      const timeout = 30000;
+      const startTime = Date.now();
+
+      const checkInterval = setInterval(() => {
+        const isLoading = document.querySelector('.gem-attachment-loading-container, .gem-attachment-content.loading');
+        const isComplete = document.querySelector('img.gem-attachment-style-img, .gem-attachment-content, [class*="attachment"]');
+
+        if (!isLoading && isComplete) {
+          clearInterval(checkInterval);
+          resolve();
+        } else if (Date.now() - startTime > timeout) {
+          clearInterval(checkInterval);
+          if (isComplete) {
+            resolve();
+          } else {
+            reject(new Error('File upload timed out or failed to attach.'));
+          }
+        }
+      }, 100);
+    });
   }
 
   function setNativeValue(element, value) {
@@ -181,7 +289,7 @@
     return list.length > 0 ? list[list.length - 1] : null;
   }
 
-  async function handleGenerate(requestId, promptText, shouldStartNewChat, imageDataUrl, includeThoughts, thinkingParam) {
+  async function handleGenerate(requestId, promptText, shouldStartNewChat, imageDataUrl, includeThoughts, thinkingParam, modelParam) {
     isProcessing = true;
     setBadgeState("processing");
     try {
@@ -194,10 +302,8 @@
         }
       }
 
-      // Check and toggle thinking mode if specified
-      if (thinkingParam !== undefined) {
-        await toggleThinkingMode(thinkingParam);
-      }
+      // Enforce target model and thinking mode
+      await setGeminiModel(modelParam || 'gemini-web', thinkingParam);
 
       if (promptText === "__DUMP_BUTTONS__") {
         const btns = Array.from(document.querySelectorAll('button, [role="button"], [role="switch"], [role="menuitem"], a')).map(b => ({
@@ -218,9 +324,52 @@
         return;
       }
 
+      if (promptText === "__DUMP_INPUTS__") {
+        const inputs = Array.from(document.querySelectorAll('input')).map(i => ({
+          tag: i.tagName,
+          type: i.type,
+          name: i.name,
+          id: i.id,
+          classes: i.className,
+          accept: i.accept
+        }));
+        setBadgeState("idle");
+        isProcessing = false;
+        api.runtime.sendMessage({
+          type: "complete",
+          id: requestId,
+          text: JSON.stringify(inputs, null, 2)
+        });
+        return;
+      }
+
+      if (promptText && promptText.startsWith("__EVAL__:")) {
+        (async () => {
+          let result = "";
+          try {
+            const raw = eval(promptText.slice(9));
+            const val = raw instanceof Promise ? await raw : raw;
+            result = JSON.stringify(val);
+          } catch (e) {
+            result = "Error: " + e.message;
+          }
+          setBadgeState("idle");
+          isProcessing = false;
+          api.runtime.sendMessage({
+            type: "complete",
+            id: requestId,
+            text: String(result)
+          });
+        })();
+        return;
+      }
+
       if (imageDataUrl) {
-        console.log("[Gemini Bridge] Uploading image payload...");
-        await uploadImage(imageDataUrl);
+        console.log("[Gemini Bridge] Uploading attachment payload...");
+        const urls = Array.isArray(imageDataUrl) ? imageDataUrl : [imageDataUrl];
+        for (const url of urls) {
+          await uploadAttachment(url);
+        }
       }
 
       const inputEl = getInputElement();
