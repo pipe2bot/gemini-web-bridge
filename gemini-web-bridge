@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""
+CLI wrapper for Gemini Web Bridge.
+Usage:
+  web-bridge "prompt text"
+  web-bridge -f document.pdf "summarize this"
+  cat file.txt | web-bridge
+"""
+import sys
+import json
+import argparse
+import urllib.request
+import urllib.error
+
+BRIDGE_URL = "http://127.0.0.1:8765/v1/chat/completions"
+
+def main():
+    parser = argparse.ArgumentParser(description="Query Gemini Web Bridge via CLI")
+    parser.add_argument("prompt", nargs="*", help="Prompt string (or pipe via stdin)")
+    parser.add_argument("-m", "--model", default="gemini-thinking-web", help="Model (default: gemini-thinking-web)")
+    parser.add_argument("-f", "--file", dest="file_path", help="Path to image or PDF attachment")
+    parser.add_argument("-n", "--new-chat", action="store_true", help="Start new chat session")
+    parser.add_argument("--no-thinking", action="store_true", help="Disable extended thinking")
+    args = parser.parse_args()
+
+    prompt_text = " ".join(args.prompt).strip()
+    if not prompt_text:
+        if not sys.stdin.isatty():
+            prompt_text = sys.stdin.read().strip()
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    payload = {
+        "model": args.model if not args.no_thinking else "gemini-web",
+        "messages": [{"role": "user", "content": prompt_text}],
+        "new_chat": args.new_chat,
+        "thinking": not args.no_thinking
+    }
+    if args.file_path:
+        payload["image_path"] = args.file_path
+
+    req = urllib.request.Request(
+        BRIDGE_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            print(content)
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")
+        sys.stderr.write(f"Bridge HTTP Error {e.code}: {err}\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"Bridge Connection Failed: {e}\nIs gemini-web-bridge service running on port 8765?\n")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

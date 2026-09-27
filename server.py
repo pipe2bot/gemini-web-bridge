@@ -160,6 +160,8 @@ async def websocket_handler(request):
                         queue, future = PENDING_REQUESTS[req_id]
                         if msg_type == "chunk":
                             await queue.put({"type": "chunk", "text": data.get("text")})
+                        elif msg_type == "heartbeat":
+                            await queue.put({"type": "heartbeat"})
                         elif msg_type == "complete":
                             await queue.put({"type": "complete", "text": data.get("text")})
                             if not future.done():
@@ -291,8 +293,17 @@ async def handle_chat_completions(request):
         try:
             last_length = 0
             while True:
-                item = await queue.get()
-                if item["type"] == "chunk":
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    # Keep-alive SSE comment ping every 10s to keep HTTP/TCP socket alive
+                    await response.write(b": keep-alive\n\n")
+                    continue
+
+                if item["type"] == "heartbeat":
+                    await response.write(b": keep-alive\n\n")
+                    continue
+                elif item["type"] == "chunk":
                     new_text = item["text"][last_length:]
                     last_length = len(item["text"])
                     chunk_data = {
@@ -333,7 +344,7 @@ async def handle_chat_completions(request):
 
     else:
         try:
-            full_text = await asyncio.wait_for(future, timeout=120.0)
+            full_text = await asyncio.wait_for(future, timeout=300.0)
             processed_text = process_thought_output(full_text, include_thoughts)
             return web.json_response({
                 "id": req_id,
@@ -350,7 +361,7 @@ async def handle_chat_completions(request):
                 }]
             })
         except asyncio.TimeoutError:
-            return web.json_response({"error": {"message": "Request timed out waiting for Gemini response."}}, status=504)
+            return web.json_response({"error": {"message": "Request timed out waiting for Gemini response (300s limit)."}}, status=504)
         except Exception as e:
             return web.json_response({"error": {"message": str(e)}}, status=500)
         finally:

@@ -186,6 +186,44 @@
     return { text: cleanText || element.innerText.trim() };
   }
 
+  function scrapeWebUIError() {
+    const errorSelectors = [
+      '.error-message',
+      'snack-bar-container',
+      '[role="alert"]',
+      '.mat-mdc-snack-bar-container',
+      '.gem-alert',
+      '.toast',
+      '.response-error'
+    ];
+    for (const selector of errorSelectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        if (el.offsetParent !== null) {
+          const text = (el.innerText || el.textContent || '').trim();
+          if (!text) continue;
+          const lower = text.toLowerCase();
+          if (
+            lower.includes('something went wrong') ||
+            lower.includes('error') ||
+            lower.includes('policy') ||
+            lower.includes('safety') ||
+            lower.includes('quota') ||
+            lower.includes('rate limit') ||
+            lower.includes('expired') ||
+            lower.includes('sign in') ||
+            lower.includes('cannot generate') ||
+            lower.includes('failed to upload') ||
+            lower.includes('try again')
+          ) {
+            return text;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   async function uploadAttachment(base64DataUrl) {
     const response = await fetch(base64DataUrl);
     const blob = await response.blob();
@@ -215,9 +253,14 @@
       uploadBtn.click();
 
       const menuStart = Date.now();
-      while (!fileInput && Date.now() - menuStart < 3000) {
-        await new Promise((r) => setTimeout(r, 100));
-        fileInput = document.querySelector(inputSelector);
+      let lastClick = menuStart;
+      while (!fileInput && Date.now() - menuStart < 8000) {
+        await new Promise((r) => setTimeout(r, 150));
+        fileInput = document.querySelector(inputSelector) || document.querySelector('input[type="file"]');
+        if (!fileInput && Date.now() - lastClick >= 2500) {
+          lastClick = Date.now();
+          uploadBtn.click();
+        }
       }
 
       if (!fileInput) {
@@ -252,25 +295,37 @@
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
 
     await new Promise((resolve, reject) => {
-      const timeout = 30000;
+      const timeout = 60000;
       const startTime = Date.now();
 
       const checkInterval = setInterval(() => {
-        const isLoading = document.querySelector('.gem-attachment-loading-container, .gem-attachment-content.loading');
+        const uiError = scrapeWebUIError();
+        if (uiError) {
+          clearInterval(checkInterval);
+          reject(new Error(`Gemini UI Error during upload: ${uiError}`));
+          return;
+        }
+
+        const isLoading = document.querySelector(
+          '.gem-attachment-loading-container, .gem-attachment-content.loading, [role="progressbar"], mat-progress-bar, mat-spinner, [aria-busy="true"]'
+        );
+        const hasRemoveBtn = document.querySelector(
+          'button[aria-label*="Remove file"], button[aria-label*="Remove"], button[aria-label*="Delete"], button[aria-label*="ลบ"]'
+        );
         const isComplete = document.querySelector('img.gem-attachment-style-img, .gem-attachment-content, [class*="attachment"]');
 
-        if (!isLoading && isComplete) {
+        if (!isLoading && (hasRemoveBtn || isComplete)) {
           clearInterval(checkInterval);
           resolve();
         } else if (Date.now() - startTime > timeout) {
           clearInterval(checkInterval);
-          if (isComplete) {
+          if (isComplete && !isLoading) {
             resolve();
           } else {
-            reject(new Error('File upload timed out or failed to attach.'));
+            reject(new Error('File upload timed out or failed to attach after 60s.'));
           }
         }
-      }, 100);
+      }, 150);
     });
   }
 
@@ -298,7 +353,12 @@
         if (newChatBtn) {
           console.log("[Gemini Bridge] Resetting chat session...");
           newChatBtn.click();
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 1200));
+          const waitStart = Date.now();
+          while (Date.now() - waitStart < 4000) {
+            if (getInputElement()) break;
+            await new Promise(r => setTimeout(r, 150));
+          }
         }
       }
 
@@ -387,6 +447,17 @@
 
       await new Promise(r => setTimeout(r, 300));
 
+      if (imageDataUrl) {
+        const uploadCheckStart = Date.now();
+        while (Date.now() - uploadCheckStart < 15000) {
+          const isLoading = document.querySelector(
+            '.gem-attachment-loading-container, .gem-attachment-content.loading, [role="progressbar"], mat-progress-bar, mat-spinner, [aria-busy="true"]'
+          );
+          if (!isLoading) break;
+          await new Promise(r => setTimeout(r, 200));
+        }
+      }
+
       const sendBtn = getSendButton();
       if (!sendBtn || sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
         throw new Error("Send button not found or disabled.");
@@ -401,9 +472,17 @@
       // Poll response text & monitor generation completion status
       let lastText = "";
       let stableCount = 0;
+      let lastHeartbeat = Date.now();
 
-      await new Promise((resolve) => {
+      await new Promise((resolve, reject) => {
         const timer = setInterval(() => {
+          const uiError = scrapeWebUIError();
+          if (uiError) {
+            clearInterval(timer);
+            reject(new Error(`Gemini UI Error: ${uiError}`));
+            return;
+          }
+
           const targetResponseEl = getLatestResponseElement();
           const parsed = getResponseContent(targetResponseEl, includeThoughts);
           const currentText = parsed.text;
@@ -413,6 +492,15 @@
 
           if (isGenerating || targetResponseEl !== initialEl || (currentText && currentText !== initialText)) {
             generationStarted = true;
+          }
+
+          // Emit keep-alive heartbeat if generating/thinking with no new text for 5s
+          if (isGenerating && (!currentText || currentText === lastText) && Date.now() - lastHeartbeat >= 5000) {
+            lastHeartbeat = Date.now();
+            api.runtime.sendMessage({
+              type: "heartbeat",
+              id: requestId
+            });
           }
 
           if (currentText !== lastText) {
@@ -438,7 +526,7 @@
         setTimeout(() => {
           clearInterval(timer);
           resolve();
-        }, 120000);
+        }, 300000);
       });
 
       const finalEl = getLatestResponseElement();

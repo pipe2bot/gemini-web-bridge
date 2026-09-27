@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 server.log
 
-# Ignore all markdown files except README.md
+# Ignore all markdown files except README.md and AGENTS.md
 *.md
 !README.md
+!AGENTS.md
