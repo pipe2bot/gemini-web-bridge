@@ -1,7 +1,24 @@
 .venv/
 __pycache__/
 *.py[cod]
-server.log
+*.log
+
+# Personal screenshots & pasted images
+Pasted image*
+*.png
+*.jpg
+*.jpeg
+*.pdf
+!test_sample.pdf
+
+# Secrets & local env
+.env
+.env.*
+
+# OS & Editor
+.DS_Store
+*.swp
+*~
 
 # Ignore all markdown files except README.md and AGENTS.md
 *.md
