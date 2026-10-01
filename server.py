@@ -93,7 +93,11 @@ def process_thought_output(text: str, include_thoughts: bool) -> str:
 def format_tools_prompt(tools: list) -> str:
     if not tools:
         return ""
-    lines = ["Available Tools:"]
+    lines = [
+        "You are an AI assistant with planning capabilities. When a task requires external data, execution, or file operations, select the appropriate tool and output the execution command strictly as a JSON object inside <tool_call> tags.",
+        "",
+        "Available Tools:"
+    ]
     for t in tools:
         fn = t.get("function", t)
         name = fn.get("name", "")
@@ -110,9 +114,12 @@ def format_tools_prompt(tools: list) -> str:
         lines.append(f"- Tool `{name}`: {desc}")
         if param_strs:
             lines.extend(param_strs)
-    lines.append("\nTool Call Protocol:")
-    lines.append("To call a tool, you MUST output:")
-    lines.append("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>")
+    lines.append("")
+    lines.append("Tool Call Format:")
+    lines.append("To call a tool, output:")
+    lines.append("<tool_call>")
+    lines.append('{"name": "tool_name", "arguments": {"param": "value"}}')
+    lines.append("</tool_call>")
     lines.append("If no tool is needed, respond with standard markdown without <tool_call> tags.")
     return "\n".join(lines)
 
