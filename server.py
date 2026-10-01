@@ -181,8 +181,9 @@ def extract_prompt_for_gemini(messages, new_chat, tools=None):
         return "Hello", None
 
     extracted_image_data = None
+    is_continuation = not new_chat and len(messages) > 2
 
-    if not new_chat and len(messages) > 1:
+    if is_continuation:
         trailing_tools = []
         for m in reversed(messages):
             if m.get("role") == "tool":
@@ -191,26 +192,28 @@ def extract_prompt_for_gemini(messages, new_chat, tools=None):
                 break
         trailing_tools.reverse()
 
-        target_messages = []
-        for m in messages:
-            if m.get("role") == "system":
-                target_messages.append(m)
-
         if trailing_tools:
-            target_messages.extend(trailing_tools)
+            target_messages = trailing_tools
         else:
-            target_messages.append(messages[-1])
+            target_messages = [messages[-1]]
+    elif not new_chat and len(messages) > 1:
+        target_messages = messages
     else:
         target_messages = messages
 
     prompt_parts = []
 
-    if tools:
+    # Inject tool schema and instructions only on first turn or new chat session
+    if tools and not is_continuation:
         prompt_parts.append(format_tools_prompt(tools))
 
     for msg in target_messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+
+        # Skip repeating system instructions on continuation turns
+        if role == "system" and is_continuation:
+            continue
 
         if role == "tool":
             tool_name = msg.get("name") or "tool"
