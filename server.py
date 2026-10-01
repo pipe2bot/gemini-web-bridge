@@ -59,6 +59,7 @@ def extract_image_payload(body: dict, messages: list) -> str | None:
 
 CONNECTED_EXTENSIONS = set()
 PENDING_REQUESTS = {}
+REQUEST_LOCK = asyncio.Lock()
 
 def process_thought_output(text: str, include_thoughts: bool) -> str:
     if not text:
@@ -389,89 +390,136 @@ async def handle_chat_completions(request):
     future = loop.create_future()
     PENDING_REQUESTS[req_id] = (queue, future)
 
-    ext_ws = next(iter(CONNECTED_EXTENSIONS))
-    await ext_ws.send_json({
-        "command": "generate",
-        "id": req_id,
-        "prompt": full_prompt,
-        "new_chat": new_chat,
-        "image_data": image_data,
-        "include_thoughts": include_thoughts,
-        "thinking": thinking,
-        "model": model
-    })
+    async with REQUEST_LOCK:
+        ext_ws = next(iter(CONNECTED_EXTENSIONS))
+        await ext_ws.send_json({
+            "command": "generate",
+            "id": req_id,
+            "prompt": full_prompt,
+            "new_chat": new_chat,
+            "image_data": image_data,
+            "include_thoughts": include_thoughts,
+            "thinking": thinking,
+            "model": model
+        })
 
-    if stream:
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
-            }
-        )
-        await response.prepare(request)
+        if stream:
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive"
+                }
+            )
+            await response.prepare(request)
 
-        try:
-            if tools:
-                full_text = ""
-                while True:
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        await response.write(b": keep-alive\n\n")
-                        continue
+            try:
+                if tools:
+                    full_text = ""
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            await response.write(b": keep-alive\n\n")
+                            continue
 
-                    if item["type"] == "heartbeat":
-                        await response.write(b": keep-alive\n\n")
-                        continue
-                    elif item["type"] == "chunk":
-                        full_text = item["text"]
-                    elif item["type"] == "complete":
-                        full_text = item.get("text", full_text)
-                        cleaned_text, tool_calls = parse_tool_calls(full_text)
-                        if tool_calls:
-                            chunk_data = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": cleaned_text.strip() or None,
-                                        "tool_calls": [
-                                            {
-                                                "index": i,
-                                                "id": tc["id"],
-                                                "type": "function",
-                                                "function": {
-                                                    "name": tc["function"]["name"],
-                                                    "arguments": tc["function"]["arguments"]
+                        if item["type"] == "heartbeat":
+                            await response.write(b": keep-alive\n\n")
+                            continue
+                        elif item["type"] == "chunk":
+                            full_text = item["text"]
+                        elif item["type"] == "complete":
+                            full_text = item.get("text", full_text)
+                            cleaned_text, tool_calls = parse_tool_calls(full_text)
+                            if tool_calls:
+                                chunk_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": cleaned_text.strip() or None,
+                                            "tool_calls": [
+                                                {
+                                                    "index": i,
+                                                    "id": tc["id"],
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tc["function"]["name"],
+                                                        "arguments": tc["function"]["arguments"]
+                                                    }
                                                 }
-                                            }
-                                            for i, tc in enumerate(tool_calls)
-                                        ]
-                                    },
-                                    "finish_reason": None
-                                }]
-                            }
-                            await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
-                            final_chunk = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "tool_calls"
-                                }]
-                            }
-                            await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
-                        else:
-                            proc = process_thought_output(full_text, include_thoughts)
+                                                for i, tc in enumerate(tool_calls)
+                                            ]
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                                final_chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "tool_calls"
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+                            else:
+                                proc = process_thought_output(full_text, include_thoughts)
+                                chunk_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": proc},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                                final_chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+                            await response.write(b"data: [DONE]\n\n")
+                            break
+                        elif item["type"] == "error":
+                            err_data = {"error": {"message": item["error"]}}
+                            await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
+                            break
+                else:
+                    last_length = 0
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            # Keep-alive SSE comment ping every 10s to keep HTTP/TCP socket alive
+                            await response.write(b": keep-alive\n\n")
+                            continue
+
+                        if item["type"] == "heartbeat":
+                            await response.write(b": keep-alive\n\n")
+                            continue
+                        elif item["type"] == "chunk":
+                            new_text = item["text"][last_length:]
+                            last_length = len(item["text"])
                             chunk_data = {
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -479,11 +527,12 @@ async def handle_chat_completions(request):
                                 "model": model,
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {"role": "assistant", "content": proc},
+                                    "delta": {"content": new_text},
                                     "finish_reason": None
                                 }]
                             }
                             await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                        elif item["type"] == "complete":
                             final_chunk = {
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -496,101 +545,54 @@ async def handle_chat_completions(request):
                                 }]
                             }
                             await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
-                        await response.write(b"data: [DONE]\n\n")
-                        break
-                    elif item["type"] == "error":
-                        err_data = {"error": {"message": item["error"]}}
-                        await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
-                        break
-            else:
-                last_length = 0
-                while True:
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        # Keep-alive SSE comment ping every 10s to keep HTTP/TCP socket alive
-                        await response.write(b": keep-alive\n\n")
-                        continue
+                            await response.write(b"data: [DONE]\n\n")
+                            break
+                        elif item["type"] == "error":
+                            err_data = {"error": {"message": item["error"]}}
+                            await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
+                            break
+            finally:
+                PENDING_REQUESTS.pop(req_id, None)
 
-                    if item["type"] == "heartbeat":
-                        await response.write(b": keep-alive\n\n")
-                        continue
-                    elif item["type"] == "chunk":
-                        new_text = item["text"][last_length:]
-                        last_length = len(item["text"])
-                        chunk_data = {
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": new_text},
-                                "finish_reason": None
-                            }]
-                        }
-                        await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
-                    elif item["type"] == "complete":
-                        final_chunk = {
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
-                        await response.write(b"data: [DONE]\n\n")
-                        break
-                    elif item["type"] == "error":
-                        err_data = {"error": {"message": item["error"]}}
-                        await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
-                        break
-        finally:
-            PENDING_REQUESTS.pop(req_id, None)
+            return response
 
-        return response
+        else:
+            try:
+                full_text = await asyncio.wait_for(future, timeout=300.0)
+                processed_text = process_thought_output(full_text, include_thoughts)
+                cleaned_text, tool_calls = parse_tool_calls(processed_text) if tools else (processed_text, [])
 
-    else:
-        try:
-            full_text = await asyncio.wait_for(future, timeout=300.0)
-            processed_text = process_thought_output(full_text, include_thoughts)
-            cleaned_text, tool_calls = parse_tool_calls(processed_text) if tools else (processed_text, [])
+                if tool_calls:
+                    msg = {
+                        "role": "assistant",
+                        "content": cleaned_text.strip() or None,
+                        "tool_calls": tool_calls
+                    }
+                    finish_reason = "tool_calls"
+                else:
+                    msg = {
+                        "role": "assistant",
+                        "content": processed_text
+                    }
+                    finish_reason = "stop"
 
-            if tool_calls:
-                msg = {
-                    "role": "assistant",
-                    "content": cleaned_text.strip() or None,
-                    "tool_calls": tool_calls
-                }
-                finish_reason = "tool_calls"
-            else:
-                msg = {
-                    "role": "assistant",
-                    "content": processed_text
-                }
-                finish_reason = "stop"
-
-            return web.json_response({
-                "id": req_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": msg,
-                    "finish_reason": finish_reason
-                }]
-            })
-        except asyncio.TimeoutError:
-            return web.json_response({"error": {"message": "Request timed out waiting for Gemini response (300s limit)."}}, status=504)
-        except Exception as e:
-            return web.json_response({"error": {"message": str(e)}}, status=500)
-        finally:
-            PENDING_REQUESTS.pop(req_id, None)
+                return web.json_response({
+                    "id": req_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": msg,
+                        "finish_reason": finish_reason
+                    }]
+                })
+            except asyncio.TimeoutError:
+                return web.json_response({"error": {"message": "Request timed out waiting for Gemini response (300s limit)."}}, status=504)
+            except Exception as e:
+                return web.json_response({"error": {"message": str(e)}}, status=500)
+            finally:
+                PENDING_REQUESTS.pop(req_id, None)
 
 def init_app():
     app = web.Application()
