@@ -42,9 +42,12 @@ Operational specifications, architectural invariants, and workflows for autonomo
   - Injects attachments via synthetic `DataTransfer` file inputs.
   - Observes response generation using `MutationObserver` and baseline `generationStarted` gating.
 - **Verification Scripts**:
+  - `test_unit_all.py`: Isolated offline unit test suite for all server/client functions (no browser required).
   - `test_openai_api.py`: Validates OpenAI API endpoint compatibility.
   - `test_extended_thinking.py`: Validates Extended Thinking model selection and thought output.
   - `test_attachment_support.py`: Validates multimodal image/doc handling and OCR.
+  - `test_tool_calling.py`: Validates OpenAI tool-calling emulation parsing and formatting.
+  - `test_gemini_web_bridge_cli.py`: Validates CLI wrapper piping, arguments, and attachments.
 - **Cache & Troubleshooting**:
   - `hotcache.md`: Live operational status and selector mappings.
   - `TROUBLESHOOT.md`: Root cause analysis records of incidents and regressions.
@@ -64,7 +67,14 @@ Operational specifications, architectural invariants, and workflows for autonomo
    - Never use arbitrary `setTimeout` delays when DOM predicates (`MutationObserver`, `waitForSelector`) can determine completion.
 4. **Clean Baseline Check**:
    - Guard against premature resolution race conditions: confirm response generation has actively begun before listening for completion.
-5. **PEP 668 Environment**:
+5. **Scoped DOM Selectors for Busy/Loading States**:
+   - Always scope loading spinners, progress bars, and upload gates to `.input-area` (`container.querySelector`). Root-level `document.querySelector('[role="progressbar"]')` will match persistent background UI spinners and hang forever.
+6. **Quill Editor Keystroke Emulation**:
+   - Never use `document.execCommand('selectAll')` in Firefox (wipes the whole document body selection). Use DOM `Range` + `Selection` to clear/insert text.
+   - Always dispatch `keyup` and `keydown` events on `.ql-editor` after text insertion to trigger Angular/Quill change detection; otherwise `button[aria-label*="Send message"]` will not mount and will remain as `Dictate (^⇧D)`.
+7. **Enterprise Policy & Sideload Scope**:
+   - Lock `extensions.autoDisableScopes: 0` in `/etc/firefox/policies/policies.json` to prevent Firefox from marking `/usr/lib/firefox/browser/extensions/` sideloaded extensions as `userDisabled: true`.
+8. **PEP 668 Environment**:
    - Always run Python within `uv venv` (`.venv/bin/python3`). Never install packages to system Python.
 
 ---
@@ -88,15 +98,22 @@ Operational specifications, architectural invariants, and workflows for autonomo
 - Firefox loads the extension automatically via `/etc/firefox/policies/policies.json` or sideloaded at `/usr/lib/firefox/browser/extensions/gemini-bridge@local.xpi`.
 - To rebuild `extension.xpi` after changing `extension/`:
   ```bash
-  zip -r -FS extension.xpi extension/*
+  cd extension && zip -FSr ../extension.xpi manifest.json background.js content.js && cd ..
   ```
+- After rebuilding `extension.xpi`, restart Firefox to flush cached bytecode and reload the extension.
 
 ### Running Test Suites
-Run test scripts against the active local bridge:
+Run offline unit tests:
+```bash
+.venv/bin/python3 test_unit_all.py
+```
+Run live integration test scripts against the active bridge:
 ```bash
 .venv/bin/python3 test_openai_api.py
 .venv/bin/python3 test_extended_thinking.py
 .venv/bin/python3 test_attachment_support.py
+.venv/bin/python3 test_tool_calling.py
+.venv/bin/python3 test_gemini_web_bridge_cli.py
 ```
 
 ### Triaging DOM Changes
