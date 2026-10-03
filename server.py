@@ -287,7 +287,7 @@ async def websocket_handler(request):
                             await queue.put({"type": "chunk", "text": data.get("text")})
                         elif msg_type == "heartbeat":
                             await queue.put({"type": "heartbeat"})
-                        elif msg_type == "complete":
+                        elif msg_type in ("complete", "response"):
                             await queue.put({"type": "complete", "text": data.get("text")})
                             if not future.done():
                                 future.set_result(data.get("text"))

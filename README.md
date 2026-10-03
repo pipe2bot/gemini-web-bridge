@@ -88,8 +88,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/pipe2bot/me/cyber/ai/gemini-web-brige
-ExecStart=/home/pipe2bot/me/cyber/ai/gemini-web-brige/.venv/bin/python3 -u server.py
+WorkingDirectory=/home/pipe2bot/me/cyber/ai/services/gemini-web-brige
+ExecStart=/home/pipe2bot/me/cyber/ai/services/gemini-web-brige/.venv/bin/python3 -u server.py
 Restart=always
 RestartSec=2
 

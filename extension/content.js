@@ -48,8 +48,10 @@
   }
 
   function getSendButton() {
-    return document.querySelector('button.send-button') ||
+    return document.querySelector('button[aria-label*="Send message"]') ||
+           document.querySelector('button.send-button') ||
            document.querySelector('button[aria-label*="Send"]') ||
+           document.querySelector('button[aria-label*="ส่งข้อความ"]') ||
            document.querySelector('button[aria-label*="ส่ง"]') ||
            document.querySelector('.send-button-container button');
   }
@@ -250,7 +252,15 @@
       if (!uploadBtn) {
         throw new Error('Upload button not found in Gemini Web UI.');
       }
-      uploadBtn.click();
+      const triggerUploadClick = () => {
+        uploadBtn.focus();
+        uploadBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+        uploadBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        uploadBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+        uploadBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        uploadBtn.click();
+      };
+      triggerUploadClick();
 
       const menuStart = Date.now();
       let lastClick = menuStart;
@@ -259,7 +269,7 @@
         fileInput = document.querySelector(inputSelector) || document.querySelector('input[type="file"]');
         if (!fileInput && Date.now() - lastClick >= 2500) {
           lastClick = Date.now();
-          uploadBtn.click();
+          triggerUploadClick();
         }
       }
 
@@ -297,6 +307,7 @@
     await new Promise((resolve, reject) => {
       const timeout = 60000;
       const startTime = Date.now();
+      let uploadStarted = false;
 
       const checkInterval = setInterval(() => {
         const uiError = scrapeWebUIError();
@@ -306,37 +317,71 @@
           return;
         }
 
-        const isLoading = document.querySelector(
-          '.gem-attachment-loading-container, .gem-attachment-content.loading, [role="progressbar"], mat-progress-bar, mat-spinner, [aria-busy="true"]'
+        const inputArea = document.querySelector('.input-area, form, [data-node-type="input-area"]') || document;
+        const isLoading = inputArea.querySelector(
+          '.gem-attachment-loading-container, .gem-attachment-content.loading, mat-progress-bar, [role="progressbar"]'
         );
-        const hasRemoveBtn = document.querySelector(
-          'button[aria-label*="Remove file"], button[aria-label*="Remove"], button[aria-label*="Delete"], button[aria-label*="ลบ"]'
+        const hasRemoveBtn = inputArea.querySelector(
+          'button[aria-label*="close attachment"], button.close-button, button[aria-label="Close"], button[aria-label*="Remove"], button[aria-label*="Delete"], button[aria-label*="ลบ"]'
         );
-        const isComplete = document.querySelector('img.gem-attachment-style-img, .gem-attachment-content, [class*="attachment"]');
+        const hasPreview = inputArea.querySelector(
+          '.file-preview-chip, .uploader-file-preview-container, .with-file-preview, img.preview-image, button.preview-image-button, user-query-file-preview, img.gem-attachment-style-img, .gem-attachment-content:not(.loading)'
+        );
 
-        if (!isLoading && (hasRemoveBtn || isComplete)) {
+        if (isLoading || hasRemoveBtn || hasPreview) {
+          uploadStarted = true;
+        }
+
+        if (uploadStarted && !isLoading && (hasRemoveBtn || hasPreview)) {
           clearInterval(checkInterval);
-          resolve();
+          setTimeout(resolve, 800);
         } else if (Date.now() - startTime > timeout) {
           clearInterval(checkInterval);
-          if (isComplete && !isLoading) {
+          if (hasPreview || hasRemoveBtn) {
             resolve();
           } else {
             reject(new Error('File upload timed out or failed to attach after 60s.'));
           }
         }
-      }, 150);
+      }, 200);
     });
   }
 
   function setNativeValue(element, value) {
     element.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('delete');
+
     document.execCommand('insertText', false, value);
-    if (!element.textContent.trim()) {
-      element.innerText = value;
-    }
     element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: 'KeyA', bubbles: true }));
+  }
+
+  async function waitForSendButton(timeout = 30000) {
+    const start = Date.now();
+    await new Promise((r) => setTimeout(r, 400));
+    while (Date.now() - start < timeout) {
+      const inputArea = document.querySelector('.input-area, form, [data-node-type="input-area"]');
+      const isStillBusy = inputArea?.querySelector(
+        'mat-progress-bar, mat-spinner, .gem-attachment-loading-container'
+      );
+      const btn = getSendButton();
+      if (!isStillBusy && btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+        return btn;
+      }
+      const inputEl = getInputElement();
+      if (inputEl) {
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+        inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: 'KeyA', bubbles: true }));
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return null;
   }
 
   function getLatestResponseElement() {
@@ -437,11 +482,6 @@
         throw new Error("Input text element not found on Gemini web page.");
       }
 
-      // Clear existing input
-      inputEl.focus();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('delete', false, null);
-
       // Insert new prompt
       setNativeValue(inputEl, promptText);
 
@@ -450,17 +490,18 @@
       if (imageDataUrl) {
         const uploadCheckStart = Date.now();
         while (Date.now() - uploadCheckStart < 15000) {
-          const isLoading = document.querySelector(
-            '.gem-attachment-loading-container, .gem-attachment-content.loading, [role="progressbar"], mat-progress-bar, mat-spinner, [aria-busy="true"]'
+          const inputArea = document.querySelector('.input-area, form, [data-node-type="input-area"]') || document;
+          const isLoading = inputArea.querySelector(
+            '.gem-attachment-loading-container, .gem-attachment-content.loading, mat-progress-bar'
           );
           if (!isLoading) break;
           await new Promise(r => setTimeout(r, 200));
         }
       }
 
-      const sendBtn = getSendButton();
-      if (!sendBtn || sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
-        throw new Error("Send button not found or disabled.");
+      const sendBtn = await waitForSendButton(30000);
+      if (!sendBtn) {
+        throw new Error("Send button not found or disabled after 30s.");
       }
 
       const initialEl = getLatestResponseElement();
@@ -468,6 +509,16 @@
       let generationStarted = false;
 
       sendBtn.click();
+      inputEl.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
 
       // Poll response text & monitor generation completion status
       let lastText = "";
