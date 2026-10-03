@@ -30,14 +30,20 @@ def extract_image_payload(body: dict, messages: list) -> str | None:
         if val:
             target = val[0] if isinstance(val, list) else val
             if isinstance(target, str):
-                return file_to_data_url(target) if os.path.isfile(os.path.expanduser(target)) else target
+                expanded = os.path.abspath(os.path.expanduser(target))
+                if os.path.isfile(expanded):
+                    return file_to_data_url(expanded)
+                if target.startswith(("http://", "https://", "data:")):
+                    return target
+                raise FileNotFoundError(f"Local attachment file not found or invalid URL: {target}")
 
     if body.get("image_data"):
         raw_val = body["image_data"]
         if isinstance(raw_val, str):
-            if os.path.isfile(os.path.expanduser(raw_val)):
-                return file_to_data_url(raw_val)
-            if raw_val.startswith("data:"):
+            expanded = os.path.abspath(os.path.expanduser(raw_val))
+            if os.path.isfile(expanded):
+                return file_to_data_url(expanded)
+            if raw_val.startswith(("http://", "https://", "data:")):
                 return raw_val
             return f"data:image/png;base64,{raw_val}"
 
@@ -50,11 +56,12 @@ def extract_image_payload(body: dict, messages: list) -> str | None:
                     url = img_info.get("url") if isinstance(img_info, dict) else img_info
                     if not url:
                         continue
-                    if url.startswith("data:"):
+                    if url.startswith(("http://", "https://", "data:")):
                         return url
-                    if os.path.isfile(os.path.expanduser(url)):
-                        return file_to_data_url(url)
-                    return url
+                    expanded = os.path.abspath(os.path.expanduser(url))
+                    if os.path.isfile(expanded):
+                        return file_to_data_url(expanded)
+                    raise FileNotFoundError(f"Local image file not found or invalid URL: {url}")
     return None
 
 CONNECTED_EXTENSIONS = set()
@@ -384,7 +391,10 @@ async def handle_chat_completions(request):
         thinking = False
 
     full_prompt, extracted_image_data = extract_prompt_for_gemini(messages, new_chat, tools=body.get("tools"))
-    image_data = extract_image_payload(body, messages) or extracted_image_data
+    try:
+        image_data = extract_image_payload(body, messages) or extracted_image_data
+    except FileNotFoundError as e:
+        return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
     req_id = f"chatcmpl-{uuid.uuid4()}"
     tools = body.get("tools")
 

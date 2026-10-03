@@ -7,6 +7,7 @@ Usage:
   cat file.txt | web-bridge
 """
 import sys
+import os
 import json
 import argparse
 import urllib.request
@@ -92,7 +93,14 @@ def main():
         "thinking": not args.no_thinking
     }
     if args.file_path:
-        payload["image_path"] = args.file_path
+        if args.file_path.startswith(("http://", "https://", "data:")):
+            payload["image_path"] = args.file_path
+        else:
+            resolved_path = os.path.abspath(os.path.expanduser(args.file_path))
+            if not os.path.exists(resolved_path):
+                sys.stderr.write(f"File not found: {args.file_path}\n")
+                sys.exit(1)
+            payload["image_path"] = resolved_path
 
     req = urllib.request.Request(
         BRIDGE_URL,

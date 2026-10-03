@@ -76,6 +76,12 @@ Operational specifications, architectural invariants, and workflows for autonomo
    - Lock `extensions.autoDisableScopes: 0` in `/etc/firefox/policies/policies.json` to prevent Firefox from marking `/usr/lib/firefox/browser/extensions/` sideloaded extensions as `userDisabled: true`.
 8. **PEP 668 Environment**:
    - Always run Python within `uv venv` (`.venv/bin/python3`). Never install packages to system Python.
+9. **Attachment Path Resolution & Daemon Isolation**:
+   - `gemini-web-bridge` CLI (`gwb -f <path>`) MUST resolve relative paths to absolute paths against caller `$PWD` (`os.path.abspath`) and verify file existence before dispatching.
+   - `server.py` runs as a detached systemd daemon under its own working directory; it must validate local attachment paths and return HTTP 400 (`invalid_request_error`) on missing files or invalid URLs instead of forwarding raw relative strings to browser `fetch()`.
+10. **Skill & Binary Sync Invariant**:
+   - After modifying `gemini-web-bridge` CLI or server behavior, immediately sync copies to `~/.local/bin/gemini-web-bridge` and `~/.local/bin/gwb`.
+   - Always update the Hermes skill (`~/.hermes/skills/web/gemini-web-bridge/SKILL.md`) to record CLI flags, path resolution invariants, or operational caveats.
 
 ---
 

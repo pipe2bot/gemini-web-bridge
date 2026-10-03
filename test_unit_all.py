@@ -63,6 +63,11 @@ class TestServerFunctions(unittest.TestCase):
     def test_extract_image_payload_none(self):
         self.assertIsNone(server.extract_image_payload({}, []))
 
+    def test_extract_image_payload_invalid_file(self):
+        body = {"image_path": "nonexistent_image_12345.png"}
+        with self.assertRaises(FileNotFoundError):
+            server.extract_image_payload(body, [])
+
     # 3. process_thought_output
     def test_process_thought_output_native(self):
         raw = "> Thinking Process:\nAnalyzing problem step-by-step\n\n42"
