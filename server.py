@@ -30,14 +30,20 @@ def extract_image_payload(body: dict, messages: list) -> str | None:
         if val:
             target = val[0] if isinstance(val, list) else val
             if isinstance(target, str):
-                return file_to_data_url(target) if os.path.isfile(os.path.expanduser(target)) else target
+                expanded = os.path.abspath(os.path.expanduser(target))
+                if os.path.isfile(expanded):
+                    return file_to_data_url(expanded)
+                if target.startswith(("http://", "https://", "data:")):
+                    return target
+                raise FileNotFoundError(f"Local attachment file not found or invalid URL: {target}")
 
     if body.get("image_data"):
         raw_val = body["image_data"]
         if isinstance(raw_val, str):
-            if os.path.isfile(os.path.expanduser(raw_val)):
-                return file_to_data_url(raw_val)
-            if raw_val.startswith("data:"):
+            expanded = os.path.abspath(os.path.expanduser(raw_val))
+            if os.path.isfile(expanded):
+                return file_to_data_url(expanded)
+            if raw_val.startswith(("http://", "https://", "data:")):
                 return raw_val
             return f"data:image/png;base64,{raw_val}"
 
@@ -50,15 +56,17 @@ def extract_image_payload(body: dict, messages: list) -> str | None:
                     url = img_info.get("url") if isinstance(img_info, dict) else img_info
                     if not url:
                         continue
-                    if url.startswith("data:"):
+                    if url.startswith(("http://", "https://", "data:")):
                         return url
-                    if os.path.isfile(os.path.expanduser(url)):
-                        return file_to_data_url(url)
-                    return url
+                    expanded = os.path.abspath(os.path.expanduser(url))
+                    if os.path.isfile(expanded):
+                        return file_to_data_url(expanded)
+                    raise FileNotFoundError(f"Local image file not found or invalid URL: {url}")
     return None
 
 CONNECTED_EXTENSIONS = set()
 PENDING_REQUESTS = {}
+REQUEST_LOCK = asyncio.Lock()
 
 def process_thought_output(text: str, include_thoughts: bool) -> str:
     if not text:
@@ -90,26 +98,150 @@ def process_thought_output(text: str, include_thoughts: bool) -> str:
 
     return text
 
-def extract_prompt_for_gemini(messages, new_chat):
+def format_tools_prompt(tools: list) -> str:
+    if not tools:
+        return ""
+    lines = [
+        "You are an AI assistant with planning capabilities. When a task requires external data, execution, or file operations, select the appropriate tool and output the execution command strictly as a JSON object inside <tool_call> tags.",
+        "",
+        "Available Tools:"
+    ]
+    for t in tools:
+        fn = t.get("function", t)
+        name = fn.get("name", "")
+        desc = (fn.get("description") or "").strip().split("\n")[0]
+        params = fn.get("parameters", {})
+        props = params.get("properties", {})
+        req = set(params.get("required", []))
+        param_strs = []
+        for p, info in props.items():
+            ptype = info.get("type", "any")
+            req_str = " (required)" if p in req else ""
+            pdesc = f" - {info.get('description')}" if info.get("description") else ""
+            param_strs.append(f"  * {p} ({ptype}{req_str}){pdesc}")
+        lines.append(f"- Tool `{name}`: {desc}")
+        if param_strs:
+            lines.extend(param_strs)
+    lines.append("")
+    lines.append("Tool Call Format:")
+    lines.append("To call a tool, output:")
+    lines.append("<tool_call>")
+    lines.append('{"name": "tool_name", "arguments": {"param": "value"}}')
+    lines.append("</tool_call>")
+    lines.append("If no tool is needed, respond with standard markdown without <tool_call> tags.")
+    return "\n".join(lines)
+
+def parse_tool_calls(text: str):
+    tool_calls = []
+    pattern = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
+    matches = list(pattern.finditer(text))
+    cleaned_text = pattern.sub("", text).strip()
+
+    for match in matches:
+        raw_json = match.group(1).strip()
+        if raw_json.startswith("```"):
+            raw_json = re.sub(r"^```(?:json)?\s*", "", raw_json)
+            raw_json = re.sub(r"\s*```$", "", raw_json)
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, dict) and "name" in parsed:
+                args = parsed.get("arguments", {})
+                if not isinstance(args, (str, dict)):
+                    args = {}
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": parsed["name"],
+                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args)
+                    }
+                })
+        except Exception:
+            continue
+
+    if not tool_calls:
+        fb_pattern = re.compile(r"```tool_call\s*([\s\S]*?)\s*```", re.IGNORECASE)
+        fb_matches = list(fb_pattern.finditer(text))
+        if fb_matches:
+            cleaned_text = fb_pattern.sub("", text).strip()
+            for match in fb_matches:
+                raw_json = match.group(1).strip()
+                try:
+                    parsed = json.loads(raw_json)
+                    if isinstance(parsed, dict) and "name" in parsed:
+                        args = parsed.get("arguments", {})
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": parsed["name"],
+                                "arguments": json.dumps(args) if isinstance(args, dict) else str(args)
+                            }
+                        })
+                except Exception:
+                    pass
+
+    return cleaned_text, tool_calls
+
+def extract_prompt_for_gemini(messages, new_chat, tools=None):
     if not messages:
         return "Hello", None
 
     extracted_image_data = None
+    is_continuation = not new_chat and len(messages) > 2
 
-    if not new_chat and len(messages) > 1:
-        target_messages = []
-        for m in messages:
-            if m.get("role") == "system":
-                target_messages.append(m)
-        target_messages.append(messages[-1])
+    if is_continuation:
+        trailing_tools = []
+        for m in reversed(messages):
+            if m.get("role") == "tool":
+                trailing_tools.append(m)
+            else:
+                break
+        trailing_tools.reverse()
+
+        if trailing_tools:
+            target_messages = trailing_tools
+        else:
+            target_messages = [messages[-1]]
+    elif not new_chat and len(messages) > 1:
+        target_messages = messages
     else:
         target_messages = messages
 
     prompt_parts = []
 
+    # Inject tool schema and instructions only on first turn or new chat session
+    if tools and not is_continuation:
+        prompt_parts.append(format_tools_prompt(tools))
+
     for msg in target_messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+
+        # Skip repeating system instructions on continuation turns
+        if role == "system" and is_continuation:
+            continue
+
+        if role == "tool":
+            tool_name = msg.get("name") or "tool"
+            prompt_parts.append(f"[Tool Result: {tool_name}]\n{content}")
+            continue
+
+        if role == "assistant" and msg.get("tool_calls"):
+            tc_blocks = []
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                tc_blocks.append(f"<tool_call>\n{json.dumps({'name': fn.get('name'), 'arguments': args})}\n</tool_call>")
+            if content:
+                prompt_parts.append(content)
+            prompt_parts.append("\n".join(tc_blocks))
+            continue
 
         if isinstance(content, list):
             text_blocks = []
@@ -162,7 +294,7 @@ async def websocket_handler(request):
                             await queue.put({"type": "chunk", "text": data.get("text")})
                         elif msg_type == "heartbeat":
                             await queue.put({"type": "heartbeat"})
-                        elif msg_type == "complete":
+                        elif msg_type in ("complete", "response"):
                             await queue.put({"type": "complete", "text": data.get("text")})
                             if not future.done():
                                 future.set_result(data.get("text"))
@@ -258,114 +390,222 @@ async def handle_chat_completions(request):
     elif model in ["gemini-web", "gemini-flash", "gemini-1.5-flash", "gemini-2.0-flash"] and thinking is None:
         thinking = False
 
-    full_prompt, extracted_image_data = extract_prompt_for_gemini(messages, new_chat)
-    image_data = extract_image_payload(body, messages) or extracted_image_data
+    full_prompt, extracted_image_data = extract_prompt_for_gemini(messages, new_chat, tools=body.get("tools"))
+    try:
+        image_data = extract_image_payload(body, messages) or extracted_image_data
+    except FileNotFoundError as e:
+        return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
     req_id = f"chatcmpl-{uuid.uuid4()}"
+    tools = body.get("tools")
 
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     PENDING_REQUESTS[req_id] = (queue, future)
 
-    ext_ws = next(iter(CONNECTED_EXTENSIONS))
-    await ext_ws.send_json({
-        "command": "generate",
-        "id": req_id,
-        "prompt": full_prompt,
-        "new_chat": new_chat,
-        "image_data": image_data,
-        "include_thoughts": include_thoughts,
-        "thinking": thinking,
-        "model": model
-    })
+    async with REQUEST_LOCK:
+        ext_ws = next(iter(CONNECTED_EXTENSIONS))
+        await ext_ws.send_json({
+            "command": "generate",
+            "id": req_id,
+            "prompt": full_prompt,
+            "new_chat": new_chat,
+            "image_data": image_data,
+            "include_thoughts": include_thoughts,
+            "thinking": thinking,
+            "model": model
+        })
 
-    if stream:
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
-            }
-        )
-        await response.prepare(request)
+        if stream:
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive"
+                }
+            )
+            await response.prepare(request)
 
-        try:
-            last_length = 0
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    # Keep-alive SSE comment ping every 10s to keep HTTP/TCP socket alive
-                    await response.write(b": keep-alive\n\n")
-                    continue
+            try:
+                if tools:
+                    full_text = ""
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            await response.write(b": keep-alive\n\n")
+                            continue
 
-                if item["type"] == "heartbeat":
-                    await response.write(b": keep-alive\n\n")
-                    continue
-                elif item["type"] == "chunk":
-                    new_text = item["text"][last_length:]
-                    last_length = len(item["text"])
-                    chunk_data = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": new_text},
-                            "finish_reason": None
-                        }]
+                        if item["type"] == "heartbeat":
+                            await response.write(b": keep-alive\n\n")
+                            continue
+                        elif item["type"] == "chunk":
+                            full_text = item["text"]
+                        elif item["type"] == "complete":
+                            full_text = item.get("text", full_text)
+                            cleaned_text, tool_calls = parse_tool_calls(full_text)
+                            if tool_calls:
+                                chunk_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": cleaned_text.strip() or None,
+                                            "tool_calls": [
+                                                {
+                                                    "index": i,
+                                                    "id": tc["id"],
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tc["function"]["name"],
+                                                        "arguments": tc["function"]["arguments"]
+                                                    }
+                                                }
+                                                for i, tc in enumerate(tool_calls)
+                                            ]
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                                final_chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "tool_calls"
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+                            else:
+                                proc = process_thought_output(full_text, include_thoughts)
+                                chunk_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": proc},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                                final_chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+                            await response.write(b"data: [DONE]\n\n")
+                            break
+                        elif item["type"] == "error":
+                            err_data = {"error": {"message": item["error"]}}
+                            await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
+                            break
+                else:
+                    last_length = 0
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            # Keep-alive SSE comment ping every 10s to keep HTTP/TCP socket alive
+                            await response.write(b": keep-alive\n\n")
+                            continue
+
+                        if item["type"] == "heartbeat":
+                            await response.write(b": keep-alive\n\n")
+                            continue
+                        elif item["type"] == "chunk":
+                            new_text = item["text"][last_length:]
+                            last_length = len(item["text"])
+                            chunk_data = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": new_text},
+                                    "finish_reason": None
+                                }]
+                            }
+                            await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
+                        elif item["type"] == "complete":
+                            final_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+                            await response.write(b"data: [DONE]\n\n")
+                            break
+                        elif item["type"] == "error":
+                            err_data = {"error": {"message": item["error"]}}
+                            await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
+                            break
+            finally:
+                PENDING_REQUESTS.pop(req_id, None)
+
+            return response
+
+        else:
+            try:
+                full_text = await asyncio.wait_for(future, timeout=300.0)
+                processed_text = process_thought_output(full_text, include_thoughts)
+                cleaned_text, tool_calls = parse_tool_calls(processed_text) if tools else (processed_text, [])
+
+                if tool_calls:
+                    msg = {
+                        "role": "assistant",
+                        "content": cleaned_text.strip() or None,
+                        "tool_calls": tool_calls
                     }
-                    await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode("utf-8"))
-                elif item["type"] == "complete":
-                    final_chunk = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
-                    await response.write(b"data: [DONE]\n\n")
-                    break
-                elif item["type"] == "error":
-                    err_data = {"error": {"message": item["error"]}}
-                    await response.write(f"data: {json.dumps(err_data)}\n\n".encode("utf-8"))
-                    break
-        finally:
-            PENDING_REQUESTS.pop(req_id, None)
-
-        return response
-
-    else:
-        try:
-            full_text = await asyncio.wait_for(future, timeout=300.0)
-            processed_text = process_thought_output(full_text, include_thoughts)
-            return web.json_response({
-                "id": req_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
+                    finish_reason = "tool_calls"
+                else:
+                    msg = {
                         "role": "assistant",
                         "content": processed_text
-                    },
-                    "finish_reason": "stop"
-                }]
-            })
-        except asyncio.TimeoutError:
-            return web.json_response({"error": {"message": "Request timed out waiting for Gemini response (300s limit)."}}, status=504)
-        except Exception as e:
-            return web.json_response({"error": {"message": str(e)}}, status=500)
-        finally:
-            PENDING_REQUESTS.pop(req_id, None)
+                    }
+                    finish_reason = "stop"
+
+                return web.json_response({
+                    "id": req_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": msg,
+                        "finish_reason": finish_reason
+                    }]
+                })
+            except asyncio.TimeoutError:
+                return web.json_response({"error": {"message": "Request timed out waiting for Gemini response (300s limit)."}}, status=504)
+            except Exception as e:
+                return web.json_response({"error": {"message": str(e)}}, status=500)
+            finally:
+                PENDING_REQUESTS.pop(req_id, None)
 
 def init_app():
     app = web.Application()

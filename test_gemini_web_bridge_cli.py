@@ -55,5 +55,12 @@ class TestGeminiWebBridgeCLI(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
         self.assertIn("charlie-test", proc.stdout)
 
+    def test_07_relative_path_attachment(self):
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        cmd = [CLI_PATH, "-f", "test_sample.pdf", "--no-thinking", "What is the exact text inside this PDF?"]
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=90)
+        self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
+        self.assertIn("Gemini Web Bridge PDF Test: Success", proc.stdout)
+
 if __name__ == "__main__":
     unittest.main()

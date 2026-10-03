@@ -7,6 +7,7 @@ Usage:
   cat file.txt | web-bridge
 """
 import sys
+import os
 import json
 import argparse
 import urllib.request
@@ -14,14 +15,68 @@ import urllib.error
 
 BRIDGE_URL = "http://127.0.0.1:8765/v1/chat/completions"
 
+def interactive_chat(model: str, thinking: bool):
+    print("=" * 60)
+    print("  Gemini Web Bridge Continuous Chat (Ctrl+C or 'exit' to quit)")
+    print("  - Commands: '/new' to reset conversation")
+    print("=" * 60 + "\n")
+    history = []
+    should_reset = False
+
+    while True:
+        try:
+            user_input = input("\nYou > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting chat.")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ["exit", "quit", "/exit"]:
+            break
+        if user_input.lower() in ["/new", "/reset"]:
+            should_reset = True
+            history = []
+            print("[*] Next prompt will reset conversation in Gemini Web.")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        payload = {
+            "model": model if thinking else "gemini-web",
+            "messages": history,
+            "new_chat": should_reset,
+            "thinking": thinking
+        }
+        should_reset = False
+
+        req = urllib.request.Request(
+            BRIDGE_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                assistant_msg = data["choices"][0]["message"]["content"]
+                history.append({"role": "assistant", "content": assistant_msg})
+                print(f"\nGemini > {assistant_msg}")
+        except Exception as e:
+            print(f"\n[Error]: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Query Gemini Web Bridge via CLI")
     parser.add_argument("prompt", nargs="*", help="Prompt string (or pipe via stdin)")
     parser.add_argument("-m", "--model", default="gemini-thinking-web", help="Model (default: gemini-thinking-web)")
     parser.add_argument("-f", "--file", dest="file_path", help="Path to image or PDF attachment")
     parser.add_argument("-n", "--new-chat", action="store_true", help="Start new chat session")
+    parser.add_argument("-c", "--chat", action="store_true", help="Start continuous interactive chat session")
     parser.add_argument("--no-thinking", action="store_true", help="Disable extended thinking")
     args = parser.parse_args()
+
+    if args.chat or (not args.prompt and sys.stdin.isatty()):
+        interactive_chat(args.model, not args.no_thinking)
+        return
 
     prompt_text = " ".join(args.prompt).strip()
     if not prompt_text:
@@ -38,7 +93,14 @@ def main():
         "thinking": not args.no_thinking
     }
     if args.file_path:
-        payload["image_path"] = args.file_path
+        if args.file_path.startswith(("http://", "https://", "data:")):
+            payload["image_path"] = args.file_path
+        else:
+            resolved_path = os.path.abspath(os.path.expanduser(args.file_path))
+            if not os.path.exists(resolved_path):
+                sys.stderr.write(f"File not found: {args.file_path}\n")
+                sys.exit(1)
+            payload["image_path"] = resolved_path
 
     req = urllib.request.Request(
         BRIDGE_URL,
